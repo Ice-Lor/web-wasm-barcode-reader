@@ -83,6 +83,50 @@ const BEEP_DATA_URI =
  */
 const ROTATION_ANGLES = [0, Math.PI / 6, -Math.PI / 6];
 
+/**
+ * Xoay dữ liệu pixel RGBA mức byte từ srcData và copy trực tiếp vào WASM HEAPU8 tại dstPtr.
+ * Sử dụng thuật toán xoay ngược (inverse mapping) quanh tâm của vùng quét.
+ * Giúp triệt tiêu hoàn toàn việc gọi getImageData và tạo canvas transform nhiều lần.
+ */
+function rotateAndCopy(
+  srcData: Uint8ClampedArray,
+  srcW: number,
+  srcH: number,
+  angle: number,
+  dstHeap: Uint8Array,
+  dstPtr: number
+): void {
+  if (angle === 0) {
+    dstHeap.set(srcData, dstPtr);
+    return;
+  }
+
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  const cx = srcW / 2;
+  const cy = srcH / 2;
+
+  // Lấp đầy vùng đệm đích bằng màu trắng (255) làm nền sạch cho ZBar
+  dstHeap.fill(255, dstPtr, dstPtr + srcW * srcH * 4);
+
+  for (let y = 0; y < srcH; y++) {
+    for (let x = 0; x < srcW; x++) {
+      const rx = Math.round((x - cx) * cos + (y - cy) * sin + cx);
+      const ry = Math.round(-(x - cx) * sin + (y - cy) * cos + cy);
+
+      if (rx >= 0 && rx < srcW && ry >= 0 && ry < srcH) {
+        const srcIdx = (ry * srcW + rx) * 4;
+        const dstIdx = dstPtr + (y * srcW + x) * 4;
+
+        dstHeap[dstIdx]     = srcData[srcIdx];
+        dstHeap[dstIdx + 1] = srcData[srcIdx + 1];
+        dstHeap[dstIdx + 2] = srcData[srcIdx + 2];
+        dstHeap[dstIdx + 3] = srcData[srcIdx + 3];
+      }
+    }
+  }
+}
+
 // ── BarcodeScanner ──────────────────────────────────────────────────
 
 export class BarcodeScanner {
@@ -133,6 +177,13 @@ export class BarcodeScanner {
   private scratchPoly: number[] = [];
   /** Reusable WASM heap pointer for RGBA scan data — allocated once at init. */
   private wasmBufferPtr = 0;
+
+  /** Góc xoay hiện tại của khung hình quét dùng để xoay ngược tọa độ polygon. */
+  private currentScanAngle = 0;
+  /** Nội dung mã vạch quét được gần nhất dùng cho throttling. */
+  private lastScannedData: string | null = null;
+  /** Thời gian quét mã vạch gần nhất dùng cho throttling. */
+  private lastScannedTime = 0;
 
   get isRunning(): boolean {
     return this._isRunning;
@@ -233,8 +284,10 @@ export class BarcodeScanner {
     this.video.setAttribute('autoplay', '');
     this.video.setAttribute('muted', '');
     this.video.setAttribute('playsinline', '');
+    this.video.setAttribute('webkit-playsinline', '');
     // Property must also be set — attribute alone doesn't satisfy autoplay policy.
     this.video.muted = true;
+    this.video.playsInline = true;
     this.container.appendChild(this.video);
 
     // Canvas for drawing polygon overlays on detected barcodes
@@ -408,16 +461,12 @@ export class BarcodeScanner {
   private async startCamera(): Promise<void> {
     if (!this.video) throw new Error('DOM not set up');
 
-    // Request scaled-up container size for a crisper barcode capture region.
-    const desiredSize = Math.round(this.cameraWidth * this.resolutionScale);
-
+    // Sử dụng cấu hình camera tối ưu 1280x720 cho iOS để tránh bị mờ tiêu cự
     const constraints: MediaStreamConstraints = {
       video: {
-        width: desiredSize,
-        height: desiredSize,
-        facingMode: this.facingMode,
-        resizeMode: 'crop-and-scale' as string,
-        aspectRatio: { ideal: 1 },
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+        facingMode: { ideal: this.facingMode },
       } as MediaTrackConstraints,
     };
 
@@ -448,17 +497,40 @@ export class BarcodeScanner {
     const handler: ProcessResultCallback = (symbol, data, polygon) => {
       if (!data) return;
 
+      // Cơ chế Throttling ngăn chặn spam kết quả trùng lặp của cùng một mã vạch trong 2 giây
+      const now = Date.now();
+      if (data === this.lastScannedData && now - this.lastScannedTime < 2000) {
+        return;
+      }
+      this.lastScannedData = data;
+      this.lastScannedTime = now;
+
       this.detectedThisTick = true;
 
-      // Convert polygon from offscreen-canvas coords to container coords
-      // using cached scale factors. Reuse scratchPoly for drawPoly to
-      // avoid allocating a new array; copy to a fresh array for the
-      // consumer's ScanResult (they may hold a reference to it).
-      const sp = this.scratchPoly;
-      sp.length = polygon.length;
+      // Xoay ngược tọa độ polygon từ hệ tọa độ xoay về hệ tọa độ gốc (0°)
+      const angle = this.currentScanAngle;
+      const w = this.offscreen!.width;
+      const h = this.offscreen!.height;
+      const cx = w / 2;
+      const cy = h / 2;
+      const cos = Math.cos(-angle);
+      const sin = Math.sin(-angle);
+
+      const rotatedPoly: number[] = [];
       for (let i = 0; i < polygon.length; i += 2) {
-        sp[i] = polygon[i] * this.polyScaleX + this.barcodeOffsetX;
-        sp[i + 1] = polygon[i + 1] * this.polyScaleY + this.barcodeOffsetY;
+        const px = polygon[i];
+        const py = polygon[i + 1];
+        const rx = (px - cx) * cos - (py - cy) * sin + cx;
+        const ry = (px - cx) * sin + (py - cy) * cos + cy;
+        rotatedPoly.push(rx, ry);
+      }
+
+      // Convert polygon from offscreen-canvas coords to container coords
+      const sp = this.scratchPoly;
+      sp.length = rotatedPoly.length;
+      for (let i = 0; i < rotatedPoly.length; i += 2) {
+        sp[i] = rotatedPoly[i] * this.polyScaleX + this.barcodeOffsetX;
+        sp[i + 1] = rotatedPoly[i + 1] * this.polyScaleY + this.barcodeOffsetY;
       }
 
       // Draw detection polygon on the overlay canvas
@@ -506,15 +578,10 @@ export class BarcodeScanner {
   private scanTick(): void {
     if (!this.video || !this.offCtx || !this.offscreen || !this.wasmApi || !this.polyCtx) return;
 
-    // videoWidth/videoHeight are the camera's actual intrinsic resolution.
-    // They're 0 until the first frame is decoded — skip until ready.
     const videoW = this.video.videoWidth;
     const videoH = this.video.videoHeight;
     if (videoW === 0 || videoH === 0) return;
 
-    // Map from container coordinates to the video's native pixel grid.
-    // The old code assumed the video was exactly 2× the container, but the
-    // camera may deliver any resolution. This scales correctly regardless.
     const scaleX = videoW / this.cameraWidth;
     const scaleY = videoH / this.cameraHeight;
 
@@ -523,7 +590,6 @@ export class BarcodeScanner {
     const srcW = this.barcodeWidth * scaleX;
     const srcH = this.barcodeHeight * scaleY;
 
-    // Only clear the polygon overlay if the previous tick drew one.
     if (this.hadDetectionLastTick) {
       this.polyCtx.clearRect(0, 0, this.cameraWidth, this.cameraHeight);
     }
@@ -531,75 +597,69 @@ export class BarcodeScanner {
     const w = this.offscreen.width;
     const h = this.offscreen.height;
 
-    // Clear preview canvas once per tick so all three rows are fresh.
     if (this.previewCtx && this.previewCanvas) {
       this.previewCtx.clearRect(0, 0, this.previewCanvas.width, this.previewCanvas.height);
     }
 
-    for (let ai = 0; ai < ROTATION_ANGLES.length; ai++) {
-      const angle = ROTATION_ANGLES[ai];
-      this.detectedThisTick = false;
+    let imageData: ImageData | null = null;
 
-      if (angle !== 0) {
-        this.offCtx.save();
-        // Rotate around the center of the offscreen canvas so the
-        // barcode region stays centered after rotation.
-        this.offCtx.translate(w / 2, h / 2);
-        this.offCtx.rotate(angle);
-        this.offCtx.translate(-w / 2, -h / 2);
-      }
-
-      // Crop the scan region from the video's intrinsic resolution
-      // and draw it into the offscreen canvas at our target size.
+    try {
+      // 1. Chỉ vẽ video chưa xoay lên offscreen canvas đúng 1 lần duy nhất
       this.offCtx.drawImage(
         this.video,
         srcX, srcY, srcW, srcH,
         0, 0, w, h,
       );
 
-      if (angle !== 0) {
-        this.offCtx.restore();
-      }
+      // 2. Chỉ gọi getImageData 1 lần duy nhất để lấy pixel thô, tránh rác RAM
+      imageData = this.offCtx.getImageData(0, 0, w, h);
 
-      // Draw this rotation pass into the preview canvas (stacked vertically).
-      if (this.previewCtx) {
-        const rowY = ai * h;
-        this.previewCtx.drawImage(this.offscreen, 0, 0, w, h, 0, rowY, w, h);
-      }
+      // 3. Thực hiện vòng lặp thử 3 góc xoay
+      for (let ai = 0; ai < ROTATION_ANGLES.length; ai++) {
+        const angle = ROTATION_ANGLES[ai];
+        this.detectedThisTick = false;
+        this.currentScanAngle = angle;
 
-      // Copy RGBA pixels into the pre-allocated WASM buffer; the C-side
-      // scan_image_rgba converts to Y800 grayscale in-place before scanning.
-      // The buffer is reused across calls — ZBar uses a no-op cleanup handler.
-      const imageData = this.offCtx.getImageData(0, 0, w, h);
-      Module.HEAPU8.set(imageData.data, this.wasmBufferPtr);
+        // Xoay byte pixel và copy trực tiếp vào bộ nhớ WASM heap (RAM cấp phát thêm = 0)
+        rotateAndCopy(imageData.data, w, h, angle, Module.HEAPU8, this.wasmBufferPtr);
 
-      // scan_image_rgba triggers Module.processResult synchronously if a barcode is found.
-      this.wasmApi.scan_image_rgba(this.wasmBufferPtr, w, h);
-
-      // Draw angle label + detection highlight on the preview row.
-      if (this.previewCtx) {
-        const rowY = ai * h;
-        const deg = Math.round(angle * 180 / Math.PI);
-        const label = `${deg >= 0 ? '+' : ''}${deg}°`;
-
-        // Green border on the row that detected
-        if (this.detectedThisTick) {
-          this.previewCtx.strokeStyle = '#00ff88';
-          this.previewCtx.lineWidth = 3;
-          this.previewCtx.strokeRect(1, rowY + 1, w - 2, h - 2);
+        // Vẽ dòng preview đã xoay tương ứng (nếu có previewCanvas debug)
+        if (this.previewCtx) {
+          const rowY = ai * h;
+          this.previewCtx.save();
+          this.previewCtx.translate(w / 2, rowY + h / 2);
+          this.previewCtx.rotate(angle);
+          this.previewCtx.translate(-w / 2, -(rowY + h / 2));
+          this.previewCtx.drawImage(this.offscreen, 0, 0, w, h, 0, rowY, w, h);
+          this.previewCtx.restore();
         }
 
-        // Angle label
-        this.previewCtx.font = 'bold 16px monospace';
-        this.previewCtx.fillStyle = this.detectedThisTick ? '#00ff88' : 'rgba(255,255,255,0.7)';
-        this.previewCtx.fillText(label, 8, rowY + 22);
+        // Chạy giải mã ZBar WASM
+        this.wasmApi.scan_image_rgba(this.wasmBufferPtr, w, h);
+
+        if (this.previewCtx) {
+          const rowY = ai * h;
+          const deg = Math.round(angle * 180 / Math.PI);
+          const label = `${deg >= 0 ? '+' : ''}${deg}°`;
+
+          if (this.detectedThisTick) {
+            this.previewCtx.strokeStyle = '#00ff88';
+            this.previewCtx.lineWidth = 3;
+            this.previewCtx.strokeRect(1, rowY + 1, w - 2, h - 2);
+          }
+
+          this.previewCtx.font = 'bold 16px monospace';
+          this.previewCtx.fillStyle = this.detectedThisTick ? '#00ff88' : 'rgba(255,255,255,0.7)';
+          this.previewCtx.fillText(label, 8, rowY + 22);
+        }
+
+        if (this.detectedThisTick) break;
       }
-
-      // Early exit: if we found a barcode at this angle, skip remaining rotations.
-      if (this.detectedThisTick) break;
+    } finally {
+      this.hadDetectionLastTick = this.detectedThisTick;
+      // Hủy liên kết tham chiếu để GC thu dọn RAM sớm
+      imageData = null;
     }
-
-    this.hadDetectionLastTick = this.detectedThisTick;
   }
 
   // ── Drawing ─────────────────────────────────────────────────────
